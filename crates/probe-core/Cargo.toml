@@ -1,0 +1,10 @@
+[package]
+name = "probe-core"
+description = "Engine-agnostic LLM output-distribution instrumentation: per-token uncertainty, hallucination-risk reports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
