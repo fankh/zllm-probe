@@ -1,4 +1,4 @@
-# llm-probe
+# zllm-probe
 
 White-box instrumentation for **any** LLM serving tool — hallucination /
 uncertainty detection today, a portable instrumentation protocol next.
