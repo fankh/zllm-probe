@@ -35,7 +35,7 @@ documented (some tools legitimately land in the T8 path).
 | **Ollama** | ⚠️ verify — OpenAI-compat layer gained logprobs only in recent versions; older ones omit the field | todo | if absent → this is the designated **T8 graceful-degradation** target. Windows install: `winget install Ollama.Ollama`; model `ollama pull llama3.2:1b`; port 11434 |
 | **LM Studio** | ⚠️ verify — OpenAI-compat server, logprobs historically not exposed | todo | GUI install; local server port 1234. Expect T8 path until confirmed |
 | **KoboldCpp** | ⚠️ verify | todo | single exe; OpenAI-compat on /v1 |
-| **zllm** | ❌ does not return logprobs today | **battery run 2026-07-07: T1/T2/T5/T7 pass; T3/T4/T6/T9 correctly land in the T8 graceful path.** Bonus: T2 caught a real zllm API bug (`"hallucination": null` on every response) — fixed in zllm same day | action item: add `logprobs`/`top_logprobs` to zllm's chat API (it computes full logits on the sampling path already) — ironic gap, fix first |
+| **zllm** | YES: logprobs:true + top_logprobs:N (chat AND legacy shapes - added 2026-07-08) | **VALIDATED 2026-07-08: battery 8/8** (was 3-pass/5-fail as a T8 target the day before): T3 risk 0.045 vs T4 0.335 monotonic; T7 legacy shape; T9 4/4 concurrent | the battery drove two zllm fixes: the hallucination:null leak (T2) and the logprobs feature itself - the matrix works as a forcing function |
 
 ## Tier 2 — WSL2 / Docker / remote Linux
 
