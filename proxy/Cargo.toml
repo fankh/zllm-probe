@@ -14,5 +14,8 @@ path = "src/main.rs"
 probe-core = { path = "../crates/probe-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 axum = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

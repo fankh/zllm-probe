@@ -15,19 +15,63 @@
 //! upstream request, feeds each returned token's top-logprobs into
 //! `probe_core::Detector`, and attaches the report. Entropy in this mode is a
 //! documented lower-bound approximation (see probe-core). Everything else —
-//! all other routes, non-detect requests — is forwarded untouched.
+//! all other routes, non-detect requests — is forwarded untouched: client
+//! headers (auth included) pass upstream minus hop-by-hop, and response
+//! bodies stream through as they arrive (SSE stays incremental).
 //!
 //! v1 limits: non-streaming only (`stream: true` + detect → 400, like the
 //! zllm reference implementation); chat + legacy completions endpoints.
 
 use axum::body::Bytes;
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use probe_core::{Detector, DetectorConfig};
 use serde_json::{json, Value};
+
+/// Headers the proxy must not blindly copy upstream: hop-by-hop headers
+/// (RFC 9110 §7.6.1), transport framing (reqwest recomputes host /
+/// content-length), and `accept-encoding` — the proxy streams bodies
+/// verbatim without decompressing, so upstream must send identity.
+fn skip_request_header(name: &str) -> bool {
+    matches!(
+        name,
+        "host" | "content-length" | "connection" | "keep-alive" | "transfer-encoding"
+            | "upgrade" | "proxy-authenticate" | "proxy-authorization" | "te" | "trailer"
+            | "accept-encoding"
+    )
+}
+
+/// Client headers → upstream headers (drops hop-by-hop; keeps auth etc.).
+fn upstream_headers(h: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in h {
+        if !skip_request_header(name.as_str()) {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    out
+}
+
+/// Forward an upstream response as a *streaming* body (SSE chunks pass
+/// through as they arrive; a buffered `bytes().await` would stall
+/// `stream: true` clients until generation finished).
+fn stream_response(resp: reqwest::Response) -> Response {
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    Response::builder()
+        .status(status)
+        .header("content-type", ct)
+        .body(axum::body::Body::from_stream(resp.bytes_stream()))
+        .unwrap()
+}
 
 #[derive(Clone)]
 struct Ctx {
@@ -58,12 +102,12 @@ async fn main() {
     axum::serve(listener, app).await.expect("serve");
 }
 
-async fn chat(State(ctx): State<Ctx>, body: Bytes) -> Response {
-    instrumented(ctx, "/v1/chat/completions", body, Mode::Chat).await
+async fn chat(State(ctx): State<Ctx>, headers: HeaderMap, body: Bytes) -> Response {
+    instrumented(ctx, "/v1/chat/completions", headers, body, Mode::Chat).await
 }
 
-async fn completions(State(ctx): State<Ctx>, body: Bytes) -> Response {
-    instrumented(ctx, "/v1/completions", body, Mode::Legacy).await
+async fn completions(State(ctx): State<Ctx>, headers: HeaderMap, body: Bytes) -> Response {
+    instrumented(ctx, "/v1/completions", headers, body, Mode::Legacy).await
 }
 
 enum Mode {
@@ -71,7 +115,7 @@ enum Mode {
     Legacy,
 }
 
-async fn instrumented(ctx: Ctx, path: &str, body: Bytes, mode: Mode) -> Response {
+async fn instrumented(ctx: Ctx, path: &str, headers: HeaderMap, body: Bytes, mode: Mode) -> Response {
     let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {e}")),
@@ -80,8 +124,9 @@ async fn instrumented(ctx: Ctx, path: &str, body: Bytes, mode: Mode) -> Response
     if let Some(o) = req.as_object_mut() {
         o.remove("detect_hallucination"); // never leak our extension upstream
     }
+    let fwd_headers = upstream_headers(&headers);
     if !detect {
-        return forward_json(&ctx, path, &req).await;
+        return forward_json(&ctx, path, fwd_headers, &req).await;
     }
     if req.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         return err(StatusCode::BAD_REQUEST, "detect_hallucination is not supported with stream=true yet");
@@ -98,7 +143,14 @@ async fn instrumented(ctx: Ctx, path: &str, body: Bytes, mode: Mode) -> Response
             }
         }
     }
-    let resp = match ctx.client.post(format!("{}{}", ctx.upstream, path)).json(&req).send().await {
+    let resp = match ctx
+        .client
+        .post(format!("{}{}", ctx.upstream, path))
+        .headers(fwd_headers)
+        .json(&req)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => return err(StatusCode::BAD_GATEWAY, &format!("upstream: {e}")),
     };
@@ -158,18 +210,18 @@ fn analyze(resp: &Value, per_token: bool) -> Result<Value, String> {
     serde_json::to_value(det.report(per_token)).map_err(|e| e.to_string())
 }
 
-/// Forward a JSON body verbatim (detect off) preserving status.
-async fn forward_json(ctx: &Ctx, path: &str, req: &Value) -> Response {
-    match ctx.client.post(format!("{}{}", ctx.upstream, path)).json(req).send().await {
-        Ok(r) => {
-            let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let ct = r.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("application/json").to_string();
-            match r.bytes().await {
-                Ok(b) => Response::builder().status(status).header("content-type", ct)
-                    .body(axum::body::Body::from(b)).unwrap(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, &format!("upstream body: {e}")),
-            }
-        }
+/// Forward a JSON body verbatim (detect off), preserving status, client
+/// headers (auth), and streaming (SSE chunks relay as they arrive).
+async fn forward_json(ctx: &Ctx, path: &str, headers: HeaderMap, req: &Value) -> Response {
+    match ctx
+        .client
+        .post(format!("{}{}", ctx.upstream, path))
+        .headers(headers)
+        .json(req)
+        .send()
+        .await
+    {
+        Ok(r) => stream_response(r),
         Err(e) => err(StatusCode::BAD_GATEWAY, &format!("upstream: {e}")),
     }
 }
@@ -184,23 +236,15 @@ async fn passthrough(State(ctx): State<Ctx>, req: Request) -> Response {
     let uri: Uri = parts.uri;
     let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
-    let mut r = ctx.client.request(method, format!("{}{}", ctx.upstream, pq));
+    let mut r = ctx
+        .client
+        .request(method, format!("{}{}", ctx.upstream, pq))
+        .headers(upstream_headers(&parts.headers));
     if parts.method != Method::GET && !bytes.is_empty() {
-        if let Some(ct) = parts.headers.get("content-type").and_then(|v| v.to_str().ok()) {
-            r = r.header("content-type", ct);
-        }
         r = r.body(bytes.to_vec());
     }
     match r.send().await {
-        Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_string();
-            match resp.bytes().await {
-                Ok(b) => Response::builder().status(status).header("content-type", ct)
-                    .body(axum::body::Body::from(b)).unwrap(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, &format!("upstream body: {e}")),
-            }
-        }
+        Ok(resp) => stream_response(resp),
         Err(e) => err(StatusCode::BAD_GATEWAY, &format!("upstream: {e}")),
     }
 }
